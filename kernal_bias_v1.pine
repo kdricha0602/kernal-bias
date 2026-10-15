@@ -1,0 +1,368 @@
+//@version=6
+// ============================================================================
+// Kernal Bias v1 [KK] — VALIDATED SPEC (in-sample) — NEW ENTITY
+// Directional-bias system, everything on 5m. Each session/time-window runs
+// its own edge; each edge uses its own PROVEN exits (validated REPORT.md §27).
+//
+// THE THREE EDGES (direction follows NQ's structural drift):
+//   Edge 1 — Evening fade SHORT: 17:15-18:15 CT range, fade the breakout
+//     after 18:15 (close > range high + 0.05xATR buffer), short only,
+//     target = range midpoint, stop = 0.10xATR past extreme,
+//     wide-range filter ON, dust filter ON, 1 trade/session, flat 23:55 CT.
+//   Edge 2 — Day ORB LONG: 08:30-09:30 CT range, buy the breakout ONLY
+//     during 09:30-10:30 CT or 11:00-12:30 CT (10:30-11:00 dead zone and
+//     afternoons skipped), 250-tick target / 60-tick stop, long only,
+//     wide filter ON, 1 trade/session, flat 15:00 CT.
+//   Edge 3 — Day 200-SMA magnet LONG: close stretched 0.3xATR below the
+//     chart-timeframe 200 SMA snaps back to it; limit = 200 SMA at entry,
+//     stop = 0.75xATR, 1 trade/session, flat 15:00 CT.
+//
+// One position at a time (pyramiding=0). Priority: EveFadeS > DayOrbL > DayMagL.
+// 1 trade per edge per session — HARDCODED (re-entry is a tested loser).
+//
+// *** HONEST SUMMARY — READ BEFORE TRADING ***
+// Validated spec (in-sample NQ 5m, Aug-Oct 2026, REPORT.md section 27):
+//   37 trades, 62.2% win, PF 3.30, t-stat 2.56, +$2,510 (+5.02% on $50K),
+//   max drawdown $305 (0.61%), profit-to-drawdown 8.2x, ~12 trades/month.
+// Per edge: fade 10 trades PF 4.12 +$644 | ORB 10 trades PF 5.58 +$602 |
+//   magnet 17 trades PF 2.67 +$1,262.
+// IN-SAMPLE — hypotheses, not proof. PAPER-TEST ONLY.
+// Kill the book if 25 forward trades don't hold combined PF > 1.2.
+// 5m is the design timeframe.
+//
+// STANDARD BAR-CLOSE: no repaint (calc_on_every_tick=false), alerts fire
+// at candle close. Intrabar not validated — don't assume it.
+// ALERTS: create a TradingView alert on this script, choose
+// "alert() function calls only" — historical bars never notify, only live.
+// Buy/sell markers plot automatically.
+// alert() JSON shaped for KTIP webhook ingestion (system key KBIAS).
+// TradingView is the final judge.
+// ============================================================================
+strategy("Kernal Bias v1 [KK]", shorttitle="KBIAS",
+     overlay=true, pyramiding=0,
+     initial_capital=50000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.91,
+     slippage=1, margin_long=0, margin_short=0, calc_on_every_tick=false)
+
+// ===================== Inputs =====================
+G_STR = "Strategy"
+G_MA  = "Moving averages (tiny, toggleable)"
+G_HL  = "Prior session H/L"
+G_AL  = "Alerts"
+G_UI  = "Display"
+G_PF  = "Prop firm"
+G_MAG = "200 SMA magnet"
+
+sessMode  = input.string("Both", "Sessions to trade", options=["Evening only", "Day only", "Both"], group=G_STR)
+sessSpec  = input.session("1715-0000:23456", "Evening session", group=G_STR)
+fhSpec    = input.session("1715-1815:23456", "Evening first-hour", group=G_STR)
+daySpec   = input.session("0830-1500:23456", "Day session", group=G_STR)
+dayFhSpec = input.session("0830-0930:23456", "Day first-hour", group=G_STR)
+orbWin1   = input.session("0930-1030:23456", "ORB window 1", group=G_STR)
+orbWin2   = input.session("1100-1230:23456", "ORB window 2", group=G_STR)
+sessTz    = input.string("America/Chicago", "Session timezone", group=G_STR)
+atrLen    = input.int(14, "Daily ATR length", minval=2, group=G_STR)
+bufMult   = input.float(0.05, "Trigger buffer (x ATR)", minval=0.0, step=0.01, group=G_STR)
+stopMult  = input.float(0.10, "Eve stop cushion past extreme (x ATR)", minval=0.0, step=0.01, group=G_STR)
+orbTgtTicks = input.int(250, "ORB target (ticks)", minval=1, group=G_STR)
+orbStpTicks = input.int(60, "ORB stop (ticks)", minval=1, group=G_STR)
+flatHour  = input.int(23, "Evening flat-by hour (CT)", minval=0, maxval=23, group=G_STR)
+flatMin   = input.int(55, "Evening flat-by minute", minval=0, maxval=59, group=G_STR)
+dayFlatHour = input.int(15, "Day flat-by hour (CT)", minval=0, maxval=23, group=G_STR)
+dayFlatMin  = input.int(0,  "Day flat-by minute", minval=0, maxval=59, group=G_STR)
+useWideFilter = input.bool(true, "Wide-range filter", group=G_STR)
+wideMult  = input.float(0.09, "Min 1H range (x ATR)", minval=0.0, step=0.01, group=G_STR)
+magLen    = input.int(200, "Magnet SMA length", minval=20, group=G_MAG)
+magStretch = input.float(0.3, "Magnet stretch trigger (x ATR)", minval=0.0, step=0.05, group=G_MAG)
+magStopMult = input.float(0.75, "Magnet stop (x ATR)", minval=0.0, step=0.05, group=G_MAG)
+
+// ---- Prop firm (Tradeify Select 50K mimicry) ----
+propTarget  = input.int(53000, "Profit target ($)", group=G_PF)
+propFloor   = input.int(48000, "Drawdown floor ($)", group=G_PF)
+usePropGuard = input.bool(true, "Halt new entries at/below floor", group=G_PF)
+useTrailFloor = input.bool(true, "Trail floor with equity peaks", group=G_PF)
+trailAmt    = input.int(2000, "Trailing drawdown ($)", minval=100, group=G_PF)
+
+showSMA10 = input.bool(true,  "Show 10 SMA",  group=G_MA)
+lenSMA10  = input.int(10, "10 SMA length",  minval=2, group=G_MA)
+colSMA10  = input.color(color.aqua,   "10 SMA color",  group=G_MA)
+showSMA21 = input.bool(true,  "Show 21 SMA",  group=G_MA)
+lenSMA21  = input.int(21, "21 SMA length",  minval=2, group=G_MA)
+colSMA21  = input.color(color.blue,   "21 SMA color",  group=G_MA)
+showEMA44 = input.bool(true,  "Show 44 EMA",  group=G_MA)
+lenEMA44  = input.int(44, "44 EMA length",  minval=2, group=G_MA)
+colEMA44  = input.color(color.orange, "44 EMA color",  group=G_MA)
+showVW100 = input.bool(true,  "Show 100 VWMA", group=G_MA)
+lenVW100  = input.int(100, "100 VWMA length", minval=2, group=G_MA)
+colVW100  = input.color(color.purple, "100 VWMA color", group=G_MA)
+showVW200 = input.bool(true,  "Show 200 VWMA", group=G_MA)
+lenVW200  = input.int(200, "200 VWMA length", minval=2, group=G_MA)
+colVW200  = input.color(color.gray,   "200 VWMA color", group=G_MA)
+
+showHL   = input.bool(true, "Show prior session H/L", group=G_HL)
+showHL_H = input.bool(true, "Show highs", group=G_HL)
+showHL_L = input.bool(true, "Show lows",  group=G_HL)
+hlCount  = input.int(3,   "Sessions back",           minval=1, maxval=5, group=G_HL)
+hlExtend = input.int(60,  "Extend bars past current", minval=0, group=G_HL)
+hlBack   = input.int(240, "Line left length (bars)",  minval=20, group=G_HL)
+
+useEntryAl = input.bool(true, "Alert on entry", group=G_AL)
+useExitAl  = input.bool(true, "Alert on exit",  group=G_AL)
+
+showSessBg = input.bool(true, "Shade the evening session", group=G_UI)
+showDbg    = input.bool(true, "Show session debug table", group=G_UI)
+
+// ===================== Timeframe guard =====================
+badTF = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly
+bgcolor(badTF ? color.new(color.red, 92) : na, title="Intraday-only warning")
+
+// ===================== Strategy core =====================
+atrD    = request.security(syminfo.tickerid, "D", ta.atr(atrLen), lookahead=barmerge.lookahead_off)
+atrPrev = atrD[1]
+buf     = nz(atrPrev, 0) * bufMult
+cushion = nz(atrPrev, 0) * stopMult
+magSMA  = ta.sma(close, magLen)
+magStretchPx = nz(atrPrev, 0) * magStretch
+magStopPx    = nz(atrPrev, 0) * magStopMult
+
+inSess  = not na(time(timeframe.period, sessSpec, sessTz))
+inFH    = not na(time(timeframe.period, fhSpec, sessTz))
+newSess = inSess and not inSess[1]
+inDay   = not na(time(timeframe.period, daySpec, sessTz))
+inDayFH = not na(time(timeframe.period, dayFhSpec, sessTz))
+newDay  = inDay and not inDay[1]
+inOrbWin = not na(time(timeframe.period, orbWin1, sessTz)) or not na(time(timeframe.period, orbWin2, sessTz))
+
+tradeEve = sessMode != "Day only"
+tradeDay = sessMode != "Evening only"
+
+// Tint while either traded session is live
+bgcolor(showSessBg and (inSess and tradeEve or inDay and tradeDay) and not badTF ? color.new(color.blue, 96) : na, title="Session tint")
+
+var float rh        = na
+var float rl        = na
+var int   tradesEve = 0
+var float rhD       = na
+var float rlD       = na
+var int   tradesOrb = 0
+var int   tradesMag = 0
+var string lastDir  = na
+var float entryPx   = na
+var float entryExt  = na
+var float entryTgt  = na
+var string lastSig  = na
+
+if newSess
+    rh := high
+    rl := low
+    tradesEve := 0
+else if inFH
+    rh := math.max(nz(rh, high), high)
+    rl := math.min(nz(rl, low), low)
+
+if newDay
+    rhD := high
+    rlD := low
+    tradesOrb := 0
+    tradesMag := 0
+else if inDayFH
+    rhD := math.max(nz(rhD, high), high)
+    rlD := math.min(nz(rlD, low), low)
+
+mid        = (rh + rl) / 2
+afterFH    = inSess and not inFH and not na(rh) and not badTF
+afterDayFH = inDay and not inDayFH and not na(rhD) and not badTF
+
+// Wide-range filter: fade/break only real first-hour liquidity events
+wideOK   = not na(rh) and not na(rl) and (rh - rl) >= wideMult * nz(atrPrev, 0)
+wideOK_D = not na(rhD) and not na(rlD) and (rhD - rlD) >= wideMult * nz(atrPrev, 0)
+
+// Dust filter: skip midpoint targets below 0.3R — validated, always on
+riskE = math.abs(close - rh) + buf + cushion
+tgtDE = close - mid
+dustE = tgtDE <= 0 or tgtDE < 0.3 * riskE
+
+// ---- Prop guard: static floor + trailing floor (uses the HIGHER) ----
+var float peakEq = na
+peakEq := na(peakEq) ? strategy.initial_capital : math.max(peakEq, strategy.equity)
+trailFloor = peakEq - trailAmt
+effFloor = useTrailFloor ? math.max(propFloor, trailFloor) : propFloor
+propOK = not usePropGuard or strategy.equity > effFloor
+
+// ---- Edge 1: evening fade SHORT (midpoint target, 0.10xATR stop) ----
+trigEveS = afterFH and close > rh + buf
+gateEve = tradeEve and trigEveS and tradesEve < 1 and not dustE and (not useWideFilter or wideOK) and propOK
+
+// ---- Edge 2: day ORB LONG (breakout, WINDOW-GATED, 250/60 ticks) ----
+trigOrbL = afterDayFH and close > rhD + buf
+gateOrb = tradeDay and trigOrbL and inOrbWin and tradesOrb < 1 and (not useWideFilter or wideOK_D) and propOK
+
+// ---- Edge 3: day 200-SMA magnet LONG (limit = SMA at entry, 0.75xATR stop) ----
+trigMagL = inDay and tradeDay and not na(magSMA) and close < magSMA - magStretchPx
+gateMag = trigMagL and tradesMag < 1 and propOK
+
+// ---- Entries: priority EveFadeS > DayOrbL > DayMagL (if-block order) ----
+if gateEve
+    strategy.entry("EveFadeS", strategy.short)
+    tradesEve += 1
+    lastDir := "SHORT"
+    entryPx := close
+    entryExt := rh
+    entryTgt := mid
+    lastSig := "EVE-S " + str.tostring(close, format.mintick)
+    if useEntryAl
+        alert('{"system":"KBIAS","ver":"v1","edge":"eve-fade","event":"entry","direction":"SHORT","price":' + str.tostring(close) +
+             ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", sessTz) + '"}',
+             alert.freq_once_per_bar_close)
+
+if gateOrb
+    strategy.entry("DayOrbL", strategy.long)
+    tradesOrb += 1
+    lastDir := "LONG"
+    entryPx := close
+    entryExt := na
+    entryTgt := na
+    lastSig := "ORB-L " + str.tostring(close, format.mintick)
+    if useEntryAl
+        alert('{"system":"KBIAS","ver":"v1","edge":"day-orb","event":"entry","direction":"LONG","price":' + str.tostring(close) +
+             ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", sessTz) + '"}',
+             alert.freq_once_per_bar_close)
+
+if gateMag
+    strategy.entry("DayMagL", strategy.long)
+    tradesMag += 1
+    lastDir := "LONG"
+    entryPx := close
+    entryExt := na
+    entryTgt := magSMA
+    lastSig := "MAG-L " + str.tostring(close, format.mintick)
+    if useEntryAl
+        alert('{"system":"KBIAS","ver":"v1","edge":"day-magnet","event":"entry","direction":"LONG","price":' + str.tostring(close) +
+             ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", sessTz) + '"}',
+             alert.freq_once_per_bar_close)
+
+// ---- Exits: per-edge proven exits ----
+if not na(entryPx)
+    strategy.exit("EveFadeS_X", from_entry="EveFadeS",
+         stop=entryPx + math.abs(entryPx - nz(entryExt, entryPx)) + buf + cushion, limit=entryTgt)
+    strategy.exit("DayOrbL_X", from_entry="DayOrbL", profit=orbTgtTicks, loss=orbStpTicks)
+    strategy.exit("DayMagL_X", from_entry="DayMagL",
+         stop=entryPx - magStopPx, limit=entryTgt)
+
+// ---- Flat-by: wall-clock — fires on EVERY intraday timeframe ----
+dFlat   = timestamp(sessTz, year(time), month(time), dayofmonth(time), flatHour, flatMin)
+flatNow = not badTF and tradeEve and inSess and not na(dFlat) and time_close >= dFlat
+dDayFlat   = timestamp(sessTz, year(time), month(time), dayofmonth(time), dayFlatHour, dayFlatMin)
+dayFlatNow = not badTF and tradeDay and inDay and not na(dDayFlat) and time_close >= dDayFlat
+if flatNow or dayFlatNow
+    strategy.close_all("EOD flat")
+    entryPx := na
+    entryExt := na
+    entryTgt := na
+
+// ---- Exit alert (fires when a trade closes, at bar close) ----
+newClose = strategy.closedtrades > nz(strategy.closedtrades[1], 0)
+if newClose and useExitAl and not na(lastDir)
+    alert('{"system":"KBIAS","ver":"v1","event":"exit","direction":"' + lastDir + '","price":' + str.tostring(close) +
+         ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", sessTz) + '"}',
+         alert.freq_once_per_bar_close)
+if strategy.position_size == 0
+    lastDir := na
+
+// ---- Session debug table + prop-firm dashboard ----
+var table dbg = table.new(position.top_right, 2, 15, border_width=1)
+if showDbg and not badTF and barstate.islast
+    eq = strategy.equity
+    toTgt = (eq - strategy.initial_capital) / math.max(propTarget - strategy.initial_capital, 1) * 100
+    ddUsed = (strategy.initial_capital - eq) / math.max(strategy.initial_capital - effFloor, 1) * 100
+    table.cell(dbg, 0, 0, "KBIAS v1", text_color=color.white, text_size=size.tiny)
+    table.cell(dbg, 1, 0, sessMode, text_size=size.tiny)
+    table.cell(dbg, 0, 1, "eve", text_size=size.tiny)
+    table.cell(dbg, 1, 1, inSess and tradeEve ? "IN SESSION" : "flat",
+         text_color=inSess and tradeEve ? color.lime : color.gray, text_size=size.tiny)
+    table.cell(dbg, 0, 2, "eve 1H", text_size=size.tiny)
+    table.cell(dbg, 1, 2, na(rh) ? "--" : str.tostring(rl, format.mintick) + " / " + str.tostring(rh, format.mintick),
+         text_size=size.tiny)
+    table.cell(dbg, 0, 3, "eve trades", text_size=size.tiny)
+    table.cell(dbg, 1, 3, str.tostring(tradesEve) + "/1", text_size=size.tiny)
+    table.cell(dbg, 0, 4, "day ORB", text_size=size.tiny)
+    table.cell(dbg, 1, 4, inDay and tradeDay ? "IN SESSION" : "flat",
+         text_color=inDay and tradeDay ? color.lime : color.gray, text_size=size.tiny)
+    table.cell(dbg, 0, 5, "day 1H", text_size=size.tiny)
+    table.cell(dbg, 1, 5, na(rhD) ? "--" : str.tostring(rlD, format.mintick) + " / " + str.tostring(rhD, format.mintick),
+         text_size=size.tiny)
+    table.cell(dbg, 0, 6, "orb trades", text_size=size.tiny)
+    table.cell(dbg, 1, 6, str.tostring(tradesOrb) + "/1", text_size=size.tiny)
+    table.cell(dbg, 0, 7, "orb win", text_size=size.tiny)
+    table.cell(dbg, 1, 7, inOrbWin and tradeDay ? "OPEN" : "closed",
+         text_color=inOrbWin and tradeDay ? color.lime : color.gray, text_size=size.tiny)
+    table.cell(dbg, 0, 8, "magnet SMA200", text_size=size.tiny)
+    table.cell(dbg, 1, 8, na(magSMA) ? "--" : str.tostring(magSMA, format.mintick), text_size=size.tiny)
+    table.cell(dbg, 0, 9, "mag trades", text_size=size.tiny)
+    table.cell(dbg, 1, 9, str.tostring(tradesMag) + "/1", text_size=size.tiny)
+    table.cell(dbg, 0, 10, "pos", text_size=size.tiny)
+    table.cell(dbg, 1, 10, strategy.position_size == 0 ? "flat" : (strategy.position_size > 0 ? "LONG" : "SHORT"),
+         text_size=size.tiny)
+    table.cell(dbg, 0, 11, "last sig", text_size=size.tiny)
+    table.cell(dbg, 1, 11, na(lastSig) ? "--" : lastSig, text_size=size.tiny)
+    table.cell(dbg, 0, 12, "equity", text_size=size.tiny)
+    table.cell(dbg, 1, 12, "$" + str.tostring(eq, "#.#"), text_size=size.tiny)
+    table.cell(dbg, 0, 13, "to target", text_size=size.tiny)
+    table.cell(dbg, 1, 13, str.tostring(toTgt, "#.#") + "%",
+         text_color=toTgt >= 100 ? color.lime : color.white, text_size=size.tiny)
+    table.cell(dbg, 0, 14, "prop floor", text_size=size.tiny)
+    table.cell(dbg, 1, 14, propOK ? "$" + str.tostring(effFloor, "#") + " (" + str.tostring(ddUsed, "#.#") + "% used)" : "FLOOR HIT",
+         text_color=propOK ? color.gray : color.red, text_size=size.tiny)
+
+// ---- First-hour ranges + magnet SMA200 (tiny) ----
+plot(not badTF and inSess and tradeEve ? rh  : na, "Eve 1H high", color.new(color.red, 0),   1, plot.style_linebr)
+plot(not badTF and inSess and tradeEve ? rl  : na, "Eve 1H low",  color.new(color.green, 0), 1, plot.style_linebr)
+plot(not badTF and inSess and tradeEve ? mid : na, "Eve 1H mid",  color.new(color.gray, 40), 1, plot.style_linebr)
+plot(not badTF and inDay and tradeDay ? rhD  : na, "Day 1H high", color.new(color.red, 0),   1, plot.style_linebr)
+plot(not badTF and inDay and tradeDay ? rlD  : na, "Day 1H low",  color.new(color.green, 0), 1, plot.style_linebr)
+plot(not badTF and inDay and tradeDay ? magSMA : na, "Magnet SMA200", color.new(color.yellow, 0), 1)
+
+// ===================== MA overlays (tiny, toggleable) =====================
+plot(showSMA10 ? ta.sma(close, lenSMA10)   : na, "10 SMA",   colSMA10, 1)
+plot(showSMA21 ? ta.sma(close, lenSMA21)   : na, "21 SMA",   colSMA21, 1)
+plot(showEMA44 ? ta.ema(close, lenEMA44)   : na, "44 EMA",   colEMA44, 1)
+plot(showVW100 ? ta.vwma(close, lenVW100)  : na, "100 VWMA", colVW100, 1)
+plot(showVW200 ? ta.vwma(close, lenVW200)  : na, "200 VWMA", colVW200, 1)
+
+// ===================== Prior session H/L (completed sessions only) =====================
+var float sessH = na
+var float sessL = na
+if newSess
+    sessH := high
+    sessL := low
+else if inSess
+    sessH := math.max(nz(sessH, high), high)
+    sessL := math.min(nz(sessL, low), low)
+
+sessEnd = inSess[1] and not inSess
+var array<float> pH = array.new_float()
+var array<float> pL = array.new_float()
+if sessEnd and barstate.isconfirmed
+    array.unshift(pH, sessH)
+    array.unshift(pL, sessL)
+    while array.size(pH) > 5
+        array.pop(pH)
+        array.pop(pL)
+
+var array<line> hlLines = array.new_line()
+if barstate.isconfirmed and showHL and not badTF
+    while array.size(hlLines) > 0
+        line.delete(array.pop(hlLines))
+    n = math.min(hlCount, array.size(pH))
+    if n > 0
+        for i = 0 to n - 1
+            fade = 55 + i * 10
+            if showHL_H
+                l1 = line.new(bar_index - hlBack, array.get(pH, i), bar_index + hlExtend, array.get(pH, i),
+                     xloc=xloc.bar_index, color=color.new(color.red, fade), width=1)
+                array.push(hlLines, l1)
+            if showHL_L
+                l2 = line.new(bar_index - hlBack, array.get(pL, i), bar_index + hlExtend, array.get(pL, i),
+                     xloc=xloc.bar_index, color=color.new(color.green, fade), width=1)
+                array.push(hlLines, l2)
